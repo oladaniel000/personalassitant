@@ -1,19 +1,15 @@
-# render.yaml — deploy as a FREE Web Service on Render
 services:
   - type: web
     name: telegram-daily-assistant
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn bot:web_app --host 0.0.0.0 --port $PORT
+    startCommand: bash start.sh
     plan: free
-
-    healthCheckPath: /healthz   # Render pings this to confirm the service is alive
-
+    healthCheckPath: /healthz
     disk:
       name: assistant-data
       mountPath: /data
       sizeGB: 1
-
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
@@ -26,7 +22,7 @@ services:
       - key: ORS_API_KEY
         sync: false
       - key: WEBHOOK_URL
-        sync: false           # Set this to your Render URL after first deploy
+        sync: false
       - key: USER_TIMEZONE
         value: Africa/Lagos
       - key: MORNING_SUMMARY_TIME
