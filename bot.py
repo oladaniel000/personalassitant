@@ -1,6 +1,6 @@
 """
 bot.py — Telegram Daily Personal Assistant
-Webhook mode for Railway/Render free hosting.
+Webhook mode for Railway free hosting.
 """
 
 import json
@@ -113,10 +113,18 @@ async def on_startup():
     users = db.query(UserState).filter(UserState.setup_complete == True).all()
     db.close()
     for user in users:
-        schedule_morning_job(user.telegram_chat_id, user.morning_time or "07:00",
-                             user.timezone or "Africa/Lagos", ptb_app)
-        schedule_evening_job(user.telegram_chat_id, user.evening_time or "21:00",
-                             user.timezone or "Africa/Lagos", ptb_app)
+        schedule_morning_job(
+            user.telegram_chat_id,
+            user.morning_time or "07:00",
+            user.timezone or "Africa/Lagos",
+            ptb_app,
+        )
+        schedule_evening_job(
+            user.telegram_chat_id,
+            user.evening_time or "21:00",
+            user.timezone or "Africa/Lagos",
+            ptb_app,
+        )
 
     scheduler.add_job(
         _sync_all_users,
@@ -169,14 +177,3 @@ if __name__ == "__main__":
         log_level="info",
         timeout_keep_alive=75,
     )
-```
-
----
-
-**Steps:**
-
-1. Go to `github.com/oladaniel000/personalassitant`
-2. Click `bot.py` → pencil icon → select all → paste the code above → **Commit changes**
-3. Go to Railway → **Variables** → set `WEBHOOK_URL` to exactly:
-```
-https://web-production-1fb97.up.railway.app
