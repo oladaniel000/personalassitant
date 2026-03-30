@@ -121,8 +121,8 @@ def push_event(token_dict: dict, event, timezone: str) -> Optional[str]:
         body = {
             "summary": event.title,
             "description": f"category:{event.category} gravity:{event.gravity}",
-            "start": {"dateTime": event.start_dt.isoformat(), "timeZone": timezone},
-            "end":   {"dateTime": event.end_dt.isoformat(),   "timeZone": timezone},
+            "start": {"dateTime": event.start_dt.replace(tzinfo=pytz.utc).astimezone(pytz.timezone(timezone)).isoformat(), "timeZone": timezone},
+            "end":   {"dateTime": event.end_dt.replace(tzinfo=pytz.utc).astimezone(pytz.timezone(timezone)).isoformat(),   "timeZone": timezone},
             "colorId": GRAVITY_COLOR.get(event.gravity, "5"),
         }
         if event.recur_rule:
