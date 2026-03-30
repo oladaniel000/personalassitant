@@ -1,7 +1,8 @@
 """
 services/reminder_service.py
-Manages all scheduled reminders using APScheduler with SQLite persistence.
-Jobs survive server restarts and offline periods.
+Manages all scheduled reminders using APScheduler.
+Jobs are persisted to the database (SQLite or PostgreSQL).
+All display times are converted to Africa/Lagos (UTC+1).
 """
 
 import logging
@@ -17,64 +18,56 @@ from config import DB_URL
 
 log = logging.getLogger(__name__)
 
-# ── Scheduler singleton — initialised in bot.py ───────────────────────────────
+DISPLAY_TZ = pytz.timezone("Africa/Lagos")
+
 scheduler: Optional[AsyncIOScheduler] = None
 
 
 def init_scheduler() -> AsyncIOScheduler:
     global scheduler
-    jobstores = {"default": SQLAlchemyJobStore(url=DB_URL)}
-    scheduler = AsyncIOScheduler(jobstores=jobstores, timezone=pytz.utc)
+    if scheduler and scheduler.running:
+        return scheduler
+    scheduler = AsyncIOScheduler(timezone=pytz.utc)
     scheduler.start()
-    log.info("APScheduler started with SQLite persistence.")
+    log.info("APScheduler started.")
     return scheduler
 
 
 def schedule_reminders(event, chat_id: str, app) -> None:
-    """
-    Calculate all reminder trigger times for `event` based on its gravity,
-    create APScheduler jobs, and store job IDs in the Reminder table.
-    """
     from database.db import get_db
     from database.models import Reminder
 
-    db   = get_db()
-    now  = datetime.utcnow().replace(tzinfo=pytz.utc)
-    start = event.start_dt.replace(tzinfo=pytz.utc) if event.start_dt.tzinfo is None else event.start_dt.astimezone(pytz.utc)
-    end   = event.end_dt.replace(tzinfo=pytz.utc)   if event.end_dt.tzinfo is None   else event.end_dt.astimezone(pytz.utc)
+    db  = get_db()
+    now = datetime.utcnow().replace(tzinfo=pytz.utc)
 
-    scheduled_times = []  # list of (trigger_dt, rtype)
+    start = event.start_dt.replace(tzinfo=pytz.utc) if event.start_dt.tzinfo is None \
+            else event.start_dt.astimezone(pytz.utc)
+    end   = event.end_dt.replace(tzinfo=pytz.utc) if event.end_dt.tzinfo is None \
+            else event.end_dt.astimezone(pytz.utc)
+
+    scheduled_times = []
 
     if event.gravity == "high":
-        # 3 days before at 09:00 UTC
         for days in [3, 1]:
-            t = (start - timedelta(days=days)).replace(hour=9, minute=0, second=0, microsecond=0)
+            t = (start - timedelta(days=days)).replace(hour=8, minute=0, second=0, microsecond=0)
             scheduled_times.append((t, f"days_before_{days}"))
-
-        # Hourly from 3h before event
         for h in range(3, 0, -1):
             t = start - timedelta(hours=h)
             scheduled_times.append((t, f"hourly_{h}h"))
-
-        # 15-minute final alert
         scheduled_times.append((start - timedelta(minutes=15), "15min"))
 
     elif event.gravity == "medium":
-        # 1 day before at 09:00 UTC
-        t = (start - timedelta(days=1)).replace(hour=9, minute=0, second=0, microsecond=0)
+        t = (start - timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0)
         scheduled_times.append((t, "days_before_1"))
-        # 30-minute alert
         scheduled_times.append((start - timedelta(minutes=30), "30min"))
 
-    # Low gravity: only shows up in the morning itinerary (no extra reminders)
-
-    # Post-event check-in for ALL gravity levels
     checkin_delay = 5 if event.gravity == "high" else 15
     scheduled_times.append((end + timedelta(minutes=checkin_delay), "checkin"))
 
+    added = 0
     for trigger_dt, rtype in scheduled_times:
         if trigger_dt <= now:
-            continue  # Skip reminders that are already in the past
+            continue
 
         job_id = f"ev{event.id}_{rtype}_{uuid.uuid4().hex[:8]}"
 
@@ -94,18 +87,16 @@ def schedule_reminders(event, chat_id: str, app) -> None:
                 job_id=job_id,
             )
             db.add(reminder)
+            added += 1
         except Exception as e:
-            log.warning(f"Could not schedule reminder {rtype} for event {event.id}: {e}")
+            log.warning(f"Could not schedule {rtype} for event {event.id}: {e}")
 
     db.commit()
     db.close()
+    log.info(f"Scheduled {added} reminder(s) for event {event.id} ({event.gravity} gravity)")
 
 
 def cancel_reminders(event_id: int) -> None:
-    """
-    Cancel all APScheduler jobs for the given event and remove Reminder rows.
-    Called before rescheduling or deleting an event.
-    """
     from database.db import get_db
     from database.models import Reminder
 
@@ -128,10 +119,6 @@ def cancel_reminders(event_id: int) -> None:
 
 
 async def _fire_reminder(event_id: int, rtype: str, chat_id: str, app) -> None:
-    """
-    Called by APScheduler at the scheduled time.
-    Sends the correct Telegram message based on rtype.
-    """
     from database.db import get_db
     from database.models import Event, Reminder
 
@@ -142,11 +129,10 @@ async def _fire_reminder(event_id: int, rtype: str, chat_id: str, app) -> None:
         db.close()
         return
 
-    # Mark reminder as sent
     reminder = db.query(Reminder).filter(
         Reminder.event_id == event_id,
-        Reminder.rtype == rtype,
-        Reminder.sent == False,
+        Reminder.rtype    == rtype,
+        Reminder.sent     == False,
     ).first()
     if reminder:
         reminder.sent = True
@@ -154,12 +140,10 @@ async def _fire_reminder(event_id: int, rtype: str, chat_id: str, app) -> None:
 
     db.close()
 
-    # Build and send the message
-    msg = _build_reminder_message(event, rtype)
-
     if rtype == "checkin":
         await _send_checkin_prompt(event, chat_id, app)
     else:
+        msg = _build_reminder_message(event, rtype)
         try:
             await app.bot.send_message(
                 chat_id=chat_id,
@@ -182,7 +166,7 @@ def _build_reminder_message(event, rtype: str) -> str:
         return (
             f"{g} *Upcoming {event.category.title()} — {days} day(s) away*\n\n"
             f"{priority}{c} *{event.title}*\n"
-            f"📅 {_fmt_dt(event.start_dt)} — {_fmt_dt(event.end_dt)}\n"
+            f"📅 {_fmt_dt(event.start_dt)}\n"
             f"⚠️ This is a *{event.gravity.upper()} priority* event."
         )
     elif rtype.startswith("hourly"):
@@ -207,21 +191,22 @@ def _build_reminder_message(event, rtype: str) -> str:
 
 
 async def _send_checkin_prompt(event, chat_id: str, app) -> None:
-    """Send the post-event check-in inline keyboard."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Done!", callback_data=f"ci_done_{event.id}"),
-            InlineKeyboardButton("❌ Not completed", callback_data=f"ci_notdone_{event.id}"),
-            InlineKeyboardButton("🔄 Partially", callback_data=f"ci_partial_{event.id}"),
-        ]
-    ])
+    start_local = pytz.utc.localize(event.start_dt).astimezone(DISPLAY_TZ)
+    end_local   = pytz.utc.localize(event.end_dt).astimezone(DISPLAY_TZ)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Done!",         callback_data=f"ci_done_{event.id}"),
+        InlineKeyboardButton("❌ Not completed", callback_data=f"ci_notdone_{event.id}"),
+        InlineKeyboardButton("🔄 Partially",     callback_data=f"ci_partial_{event.id}"),
+    ]])
     try:
         await app.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"⏱ *{event.title}* just ended.\n\n"
+                f"⏱ *{event.title}* just ended "
+                f"({start_local.strftime('%H:%M')}–{end_local.strftime('%H:%M')}).\n\n"
                 f"Did you complete it?"
             ),
             reply_markup=keyboard,
@@ -232,8 +217,14 @@ async def _send_checkin_prompt(event, chat_id: str, app) -> None:
 
 
 def _fmt_dt(dt: datetime) -> str:
-    return dt.strftime("%a %d %b, %H:%M") if dt else "?"
+    if not dt:
+        return "?"
+    local = pytz.utc.localize(dt).astimezone(DISPLAY_TZ)
+    return local.strftime("%a %d %b, %H:%M")
 
 
 def _fmt_time(dt: datetime) -> str:
-    return dt.strftime("%H:%M") if dt else "?"
+    if not dt:
+        return "?"
+    local = pytz.utc.localize(dt).astimezone(DISPLAY_TZ)
+    return local.strftime("%H:%M")
